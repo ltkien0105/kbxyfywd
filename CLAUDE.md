@@ -1,0 +1,133 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+A more exhaustive agent guide already lives in `AGENTS.md`. Read it for full conventions (naming, file ownership, error handling, code style). This file captures the high-leverage essentials and the "big picture" architecture.
+
+## What this project is
+
+`卡布西游浮影微端` (kbwebui) — a Windows x64 desktop helper for a Flash-era web game. Single executable target `WebView2Demo` built from C++17 with MSVC. The app:
+
+- Hosts the tool UI in **WebView2** (HTML/CSS/JS embedded from `resources/ui.html`)
+- Hosts the game itself via **ATL `CAxWindow` + `IWebBrowser2`** (legacy IE engine — required for Flash)
+- Uses **MinHook + custom socket interception** to read/modify game packets in flight
+- Drives "activity automation" by waiting for specific opcodes and replying with crafted packets
+
+UI text and many comments are in Chinese; preserve them on edits.
+
+## Build
+
+```powershell
+# Configure (Visual Studio 2019 or 2022, x64)
+cmake -S . -B build_new -G "Visual Studio 17 2022" -A x64
+
+# Build Release
+cmake --build build_new --config Release
+
+# Run
+.\build_new\bin\Release\WebView2Demo.exe
+```
+
+Critical gotchas:
+
+- `CMakeLists.txt` **hardcodes** `VCPKG_ROOT` to `d:/AItrace/CE/.trae/vcpkg-master`. Builds will fail elsewhere unless you edit that path. Don't commit a path change unless asked.
+- Configure-time custom commands invoke `python3` (must be on PATH, not just `python`) to regenerate three embedded headers from `resources/ui.html`, `WebView2Loader.dll`, and `zlib1.dll`. If `python3` isn't aliased, configure fails before any compile.
+- After incremental edits, the existing `build_new/` tree is fine — re-run `cmake --build build_new --config Release` only.
+
+There is **no test framework, no lint target, no `.clang-format`**. Validation = rebuild + manual smoke-test the affected workflow in the running app. Say so explicitly when reporting work; do not claim "tests pass."
+
+## High-level architecture
+
+The control flow is roughly: **WebView2 UI ↔ web message handler ↔ app host facade ↔ hook layer ↔ game packets**.
+
+```
+resources/ui.html  ──(JS postMessage)──►  src/core/web_message_handler.cpp
+                                                  │
+                                                  ▼
+                                          src/app/app_host.cpp        (UI action facade)
+                                                  │
+                                                  ▼
+                                          src/hook/wpe_hook.cpp       (~12k lines — main hub)
+                                          src/hook/horse_competition.cpp
+                                          src/hook/wpe_hook_helpers.cpp
+                                                  │   ▲
+                          send packets  ──────────┘   │  intercept responses
+                                                  ▼   │
+                                          src/protocol/packet_builder.cpp
+                                          src/protocol/packet_parser.cpp
+                                                  │
+                                                  ▼
+                                              game socket
+```
+
+Layer responsibilities:
+
+- **`src/app/`** — entrypoint, main window, WebView2 init, global UI state. `demo.cpp` owns `WinMain` and the message loop; `app_host.cpp` is the action facade UI handlers should call into instead of poking globals directly.
+- **`src/core/`** — bridges and shared helpers. `ui_bridge.cpp` (C++ → JS), `web_message_handler.cpp` (JS → C++), `data_interceptor.cpp` (HTTP response rewriting), `utils.cpp` (Win32/string helpers).
+- **`src/hook/`** — MinHook lifecycle, socket interception, packet dispatch, automation state machines. `wpe_hook.cpp` is the catch-all hub; `horse_competition.cpp` is the only feature already split out.
+- **`src/protocol/`** — wire format: parsing, building, opcode tables, zlib decompression for compressed packets.
+
+Header layout mirrors source but adds two extra dirs:
+
+- **`include/activities/`** — public per-feature declarations (battle_six, dungeon_jump, horse_competition, shuangtai, spirit_collect, activity_minigames). New activity? Add a header here.
+- **`include/internal/`** — private state machines, response waiters, dispatcher glue. Don't expose these in `include/activities/`.
+- **`include/protocol/`** — `packet_types.h` (wire types), `packet_protocol.h` / `packet_parser.h` (opcode constants), `packet_builder.h`, `packet_zlib_api.h`.
+- **`include/core/window_messages.h`** — the canonical home for `WM_USER+N` IDs used for cross-thread UI handoff. Add new ones here, not as ad-hoc literals scattered through hook code.
+
+## Embedded assets — what's generated vs. checked in
+
+`embedded/` mixes generator output and vendored helpers. Treat them differently:
+
+| File | Status | Edit? |
+|---|---|---|
+| `embedded/ui_html.h` | Generated by `scripts/embed_html.py` from `resources/ui.html` | No — edit `resources/ui.html` and rebuild |
+| `embedded/webview2loader_data.h` | Generated by `scripts/embed_dll.py` from vcpkg `WebView2Loader.dll` | No |
+| `embedded/zlib_data.h` | Generated by `scripts/embed_dll.py` from vcpkg `zlib1.dll` | No |
+| `embedded/minhook_data.h` | Checked-in vendor blob | Edit only if intentionally swapping the hook lib |
+| `embedded/speed_x64_data.h` | Checked-in speedhack helper | Same |
+| `embedded/minizip_helper.h` | Checked-in helper | Same |
+
+If frontend changes don't show up at runtime, the build didn't regenerate `ui_html.h` — re-run the build, don't hand-patch the header.
+
+## Game packet protocol (load-bearing context for hook/activity work)
+
+Wire layout:
+
+```
+Magic(2) | Length(2) | Opcode(4) | Params(4) | Body
+```
+
+- All multi-byte fields are **little-endian**.
+- `Magic = 0x5344` → uncompressed body. `Magic = 0x5343` → zlib-compressed body (use the helpers in `packet_zlib_api.h`).
+- Don't open-code the layout — use `PacketBuilder` for sends and `packet_parser.cpp` helpers for reads.
+- Opcode constants live in `packet_protocol.h` / `packet_parser.h`. Add new ones there, not inline.
+
+Standard recipe for adding a new game feature:
+
+1. Add opcode constants and any wire structs to `include/protocol/`.
+2. Declare the activity API in `include/activities/<feature>.h`.
+3. Put any internal state machine / response waiter in `include/internal/`.
+4. Implement send/parse/automation in `src/hook/wpe_hook.cpp` (or split into `src/hook/<feature>.cpp` if it's large enough to deserve its own TU — horse_competition is the precedent).
+5. Wire the UI entrypoint in `src/core/web_message_handler.cpp` → `src/app/app_host.cpp`.
+6. If JS needs to call it, expose an action in `resources/ui.html`.
+
+## Conventions worth knowing before editing
+
+- **C++17**, MSVC, Win32-flavored. `std::wstring` for UI/Windows-facing strings, `std::string` for protocol/narrow paths. Fixed-width ints (`uint32_t` etc.) in packet structs.
+- **Naming**: `PascalCase` for classes/functions/namespaces, `camelCase` for locals, `g_` prefix for globals, `UPPER_SNAKE_CASE` for macros/`constexpr`. Match the file you're editing.
+- **Error handling**: COM-style `HRESULT` + `FAILED/SUCCEEDED`, `BOOL`/`bool` returns, guard clauses. No exceptions across Win32 boundaries unless the file already uses them.
+- **Concurrency**: `wpe_hook.cpp` and `demo.cpp` share global state guarded by `CRITICAL_SECTION`/`CONDITION_VARIABLE`/atomics. Use whichever primitive that file already uses; don't introduce a new synchronization style mid-file.
+- **Don't** add new external dependencies, reformat files wholesale, or rewrite Chinese comments/UI strings into English unless that's the task.
+- **Cross-thread UI**: post `WM_USER+N` messages defined in `include/core/window_messages.h`, don't `SendMessage` from worker threads.
+
+## File size note
+
+`src/hook/wpe_hook.cpp` is ~12k lines and `src/app/demo.cpp` is ~1.7k. Both are intentionally large because they own per-feature dispatch. Prefer **minimal, surgical diffs** in these files. Splitting them is reasonable only if a feature already has a clean seam (the way `horse_competition.cpp` was extracted).
+
+## When to consult AGENTS.md
+
+`AGENTS.md` has the full per-file path map, naming/include rules, and runtime validation checklist. Read it when:
+
+- Placing a brand-new file (it spells out which dir gets which kind of code).
+- You're unsure whether a header is generated or vendored.
+- You need the exact include order and forward-decl conventions.
